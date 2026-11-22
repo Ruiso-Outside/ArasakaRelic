@@ -21,11 +21,27 @@ from pathlib import Path
 
 APP_ID = "arasaka-relic"
 APP_NAME = "ARASAKA RELIC"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 HOME = Path(os.environ.get("ARASAKA_RELIC_HOME") or Path.home())
-DATA = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / APP_ID
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / APP_ID
+
+
+def _config_home() -> Path:
+    """Configuracoes: %APPDATA% no Windows, ~/.config (XDG) no Linux. Com a pasta pessoal trocada (testes), fica nela."""
+    if sys.platform == "win32" and HOME == Path.home():
+        return Path(os.environ.get("APPDATA") or HOME)
+    return Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+
+
+def _data_home() -> Path:
+    """Dados: %LOCALAPPDATA% no Windows, ~/.local/share (XDG) no Linux."""
+    if sys.platform == "win32" and HOME == Path.home():
+        return Path(os.environ.get("LOCALAPPDATA") or HOME)
+    return Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share"))
+
+
+DATA = _data_home() / APP_ID
+CONFIG_DIR = _config_home() / APP_ID
 ASSETS = Path(__file__).resolve().parent / "assets"
 LOG_DIR = DATA / "logs"
 STAMP = "%Y-%m-%d_%H%M%S"
@@ -33,10 +49,24 @@ SNAP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}$")
 
 
 # ================================================================ pastas do usuario
+WIN = sys.platform == "win32"
+WIN_DIRS = {"DOCUMENTS": "Personal", "PICTURES": "My Pictures", "MUSIC": "My Music", "VIDEOS": "My Video",
+            "DESKTOP": "Desktop", "DOWNLOAD": "{374DE290-123F-4565-9164-39C4925E467B}"}
+
+
 def user_dir(key: str, fallback: str) -> Path:
-    """Pastas do xdg-user-dirs (Documentos, Imagens...) no idioma do sistema."""
+    """Pastas do usuario (Documentos, Imagens...): no Windows pelo registro do Explorer (seguem a pasta movida
+    para outro disco); no Linux pelo xdg-user-dirs, no idioma do sistema."""
+    if WIN and HOME == Path.home():
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as k:
+                return Path(os.path.expandvars(winreg.QueryValueEx(k, WIN_DIRS[key])[0]))
+        except Exception:  # noqa: BLE001
+            pass
     try:
-        txt = (Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "user-dirs.dirs").read_text(encoding="utf-8")
+        txt = (_config_home() / "user-dirs.dirs").read_text(encoding="utf-8")
         m = re.search(rf'^XDG_{key}_DIR="?([^"\n]+)"?', txt, re.M)
         if m:
             return Path(m.group(1).replace("$HOME", str(HOME)))
@@ -55,8 +85,8 @@ class Source:
 
 
 def presets() -> list[Source]:
-    cfg = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
-    share = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share"))
+    cfg = _config_home()
+    share = _data_home()
     arasaka_cfg = sorted(p for p in cfg.glob("arasaka*") if p.is_dir() and p.name != APP_ID)
     return [
         Source("documents", "Documentos", [user_dir("DOCUMENTS", "Documents")], True),
@@ -76,6 +106,8 @@ def presets() -> list[Source]:
 
 DEFAULT_EXCLUDES = ["*.tmp", "*.part", "*.crdownload", "node_modules/", "__pycache__/", ".cache/", "Cache/",
                     "CachedData/", "GPUCache/", ".venv/", "venv/", "*.iso", "Trash/", ".Trash-*/"]
+if sys.platform == "win32":
+    DEFAULT_EXCLUDES += ["desktop.ini", "Thumbs.db", "$RECYCLE.BIN/", "~$*"]
 
 
 # ================================================================ configuracao
@@ -170,6 +202,8 @@ def rel_in_snapshot(src: Path) -> str:
     try:
         return str(src.relative_to(HOME))
     except ValueError:
+        if WIN:   # C:\Dados\x -> raiz/C/Dados/x
+            return str(Path("raiz", src.drive.rstrip(":\\/") or "unc", *src.parts[1:]))
         return "raiz" + str(src)
 
 
@@ -178,12 +212,75 @@ def original_path(snapshot: Path, inside: Path) -> Path:
     rel = inside.relative_to(snapshot)
     parts = rel.parts
     if parts and parts[0] == "raiz":
+        if WIN and len(parts) > 1:
+            return Path(parts[1] + ":\\", *parts[2:])
         return Path("/", *parts[1:])
     return HOME / rel
 
 
 def rsync_ok() -> bool:
-    return shutil.which("rsync") is not None
+    return shutil.which("rsync") is not None and not os.environ.get("ARASAKA_RELIC_NO_RSYNC")
+
+
+def _excluded(name: str, is_dir: bool, excludes: list[str]) -> bool:
+    for e in excludes:
+        if e.endswith("/"):
+            if is_dir and fnmatch.fnmatch(name, e[:-1]):
+                return True
+        elif fnmatch.fnmatch(name, e):
+            return True
+    return False
+
+
+def py_sync(src: Path, target: Path, link_dest: Path | None, excludes: list[str], on_file=None) -> int:
+    """Copia src para target (pasta nova) como o rsync -a --link-dest: o arquivo igual ao da foto anterior
+    (mesmo tamanho e data) vira hardlink dela; o resto e copiado com as datas. Disco sem hardlink (FAT/exFAT): copia.
+    Devolve o numero de erros."""
+    errors = 0
+
+    def one(a: Path, b: Path, prev: Path | None):
+        nonlocal errors
+        try:
+            st = a.stat()
+            if prev is not None:
+                try:
+                    ps = prev.stat()
+                    if ps.st_size == st.st_size and int(ps.st_mtime) == int(st.st_mtime):
+                        os.link(prev, b)
+                        return
+                except OSError:
+                    pass
+            shutil.copy2(a, b)
+        except OSError:
+            errors += 1
+        if on_file:
+            on_file(a)
+
+    if src.is_file():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        one(src, target, link_dest if link_dest and link_dest.is_file() else None)
+        return errors
+    for root, dirs, files in os.walk(src):
+        dirs[:] = [d for d in dirs if not _excluded(d, True, excludes) and not os.path.islink(os.path.join(root, d))]
+        rel = Path(root).relative_to(src)
+        out = target / rel
+        out.mkdir(parents=True, exist_ok=True)
+        for f in files:
+            if _excluded(f, False, excludes):
+                continue
+            prev = (link_dest / rel / f) if link_dest else None
+            one(Path(root) / f, out / f, prev)
+    return errors
+
+
+def count_files(src: Path, excludes: list[str]) -> int:
+    if src.is_file():
+        return 1
+    n = 0
+    for _root, dirs, files in os.walk(src):
+        dirs[:] = [d for d in dirs if not _excluded(d, True, excludes)]
+        n += sum(1 for f in files if not _excluded(f, False, excludes))
+    return n
 
 
 def dest_status(dest: str) -> tuple[bool, str]:
@@ -230,7 +327,8 @@ def run_backup(cfg: Config, on_progress=None, on_line=None) -> Snapshot:
     ok, why = dest_status(cfg["dest"])
     if not ok:
         raise RuntimeError(why)
-    if not rsync_ok():
+    use_rsync = rsync_ok()
+    if not use_rsync and not WIN and not os.environ.get("ARASAKA_RELIC_NO_RSYNC"):
         raise RuntimeError("o rsync nao esta instalado (sudo apt install rsync)")
     sources = cfg.selected_paths()
     if not sources:
@@ -261,6 +359,20 @@ def run_backup(cfg: Config, on_progress=None, on_line=None) -> Snapshot:
         args += [str(src) + ("/" if src.is_dir() else ""), str(target) + ("/" if src.is_dir() else "")]
         say(f"> {src}")
         base = i / len(sources)
+        if not use_rsync:   # Windows: a mesma foto com hardlinks, copiada em Python
+            prev_rel = (prev.path / rel) if prev and (prev.path / rel).exists() else None
+            total = max(1, count_files(src, cfg["excludes"] or []))
+            done = [0]
+
+            def tick(_f, base=base, total=total, done=done, name=src.name):
+                done[0] += 1
+                if on_progress and done[0] % 25 == 0:
+                    on_progress(min(base + done[0] / total / len(sources), 0.999), f"{name}: {done[0]}/{total}")
+            bad = py_sync(src, target, prev_rel, cfg["excludes"] or [], tick)
+            if bad:
+                errors += 1
+                say(f"!! {bad} arquivo(s) nao copiado(s) em {src} (em uso ou sem permissao)")
+            continue
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         buf = ""
         while True:
@@ -321,12 +433,20 @@ def delete_snapshot(s: Snapshot):
 
 def restore(snapshot: Path, inside: Path, target: Path | None = None, on_line=None) -> Path:
     """Copia de volta. Sem target: para o lugar original (sobrescreve o que mudou, nao apaga nada a mais)."""
-    if not rsync_ok():
-        raise RuntimeError("o rsync nao esta instalado")
     dst = target or original_path(snapshot, inside)
     if target and inside.is_dir():
         dst = target / inside.name
     dst.parent.mkdir(parents=True, exist_ok=True)
+    if not rsync_ok():
+        if not WIN and not os.environ.get("ARASAKA_RELIC_NO_RSYNC"):
+            raise RuntimeError("o rsync nao esta instalado")
+        if inside.is_dir():
+            shutil.copytree(inside, dst, dirs_exist_ok=True, copy_function=shutil.copy2)
+        else:
+            shutil.copy2(inside, dst)
+        if on_line:
+            on_line(f"■ restaurado: {dst}")
+        return dst
     args = ["rsync", "-a", str(inside) + ("/" if inside.is_dir() else ""), str(dst) + ("/" if inside.is_dir() else "")]
     r = subprocess.run(args, capture_output=True, text=True)
     if r.returncode not in (0, 24):
@@ -337,11 +457,13 @@ def restore(snapshot: Path, inside: Path, target: Path | None = None, on_line=No
 
 
 # ================================================================ agenda (systemd --user)
-UNIT_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "systemd" / "user"
+UNIT_DIR = _config_home() / "systemd" / "user"
 
 
 def set_schedule(on: bool) -> str:
     """Liga/desliga o backup diario. Devolve uma mensagem."""
+    if WIN:
+        return _schedule_windows(on)
     svc, tmr = UNIT_DIR / f"{APP_ID}.service", UNIT_DIR / f"{APP_ID}.timer"
     if not shutil.which("systemctl"):
         return "este sistema nao tem o systemd: a agenda nao funciona aqui"
@@ -360,6 +482,30 @@ def set_schedule(on: bool) -> str:
         f.unlink(missing_ok=True)
     subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
     return "backup diario desligado"
+
+
+TASK = "Arasaka Relic"
+
+
+def _schedule_windows(on: bool) -> str:
+    """Backup diario pelo Agendador de Tarefas (sem administrador). Roda depois, se o PC estava desligado na hora."""
+    def ps(cmd: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if not on:
+        ps(f"Unregister-ScheduledTask -TaskName '{TASK}' -Confirm:$false -ErrorAction SilentlyContinue")
+        return "backup diario desligado"
+    data = Path(os.environ.get("LOCALAPPDATA") or HOME) / APP_ID
+    pyw, launch = data / "venv" / "Scripts" / "pythonw.exe", data / "launch.pyw"
+    if not pyw.is_file() or not launch.is_file():
+        return "instale o Relic pelo install.bat (ou pela Arasaka Central) para usar a agenda"
+    r = ps(f"$a = New-ScheduledTaskAction -Execute '{pyw}' -Argument '\"{launch}\" --run'; "
+           "$t = New-ScheduledTaskTrigger -Daily -At 12:00; "
+           "$s = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; "
+           f"Register-ScheduledTask -TaskName '{TASK}' -Description 'ARASAKA RELIC: backup diario' -Action $a -Trigger $t "
+           "-Settings $s -Force | Out-Null")
+    return "backup diario ligado (12:00, ou assim que o PC ligar)" if r.returncode == 0 else \
+        f"falha ao ligar a agenda: {(r.stderr or r.stdout).strip()[:160]}"
 
 
 def notify(title: str, body: str):

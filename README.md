@@ -40,6 +40,11 @@ Pela **Arasaka Central** (Loja → Apps), ou:
 Rode **sem sudo**; ele pede a senha só para instalar o rsync, se faltar. Para remover: `./uninstall.sh`
 (os backups que você fez continuam no destino).
 
+### Windows 10/11
+
+Pela **Arasaka Central** (Loja → Apps), ou extraia o `ArasakaRelic-vX.Y.Z-windows.zip` e dê dois cliques em **`install.bat`**. O instalador instala o Python 3.12 pelo winget (se ainda não houver), cria os atalhos no Menu Iniciar e na Área de Trabalho e o comando `arasaka-relic`. Não precisa de administrador. No Windows o Relic não precisa do rsync: a cópia é feita pelo próprio app, com os mesmos hardlinks (num HD com NTFS; em pendrive FAT/exFAT cada foto é uma cópia inteira), e o backup diário fica no Agendador de Tarefas.
+Para remover: `powershell -ExecutionPolicy Bypass -File uninstall.ps1` (os seus dados são mantidos).
+
 ## Restaurar sem o Relic
 
 Os backups são pastas normais. Num sistema novo, abra a foto mais recente no gerenciador de arquivos e copie

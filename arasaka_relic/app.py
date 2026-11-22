@@ -312,7 +312,7 @@ class DestPage(Page):
         self.sched.blockSignals(False)
 
     def pick(self):
-        d = QFileDialog.getExistingDirectory(self, "Onde guardar os backups", self.win.cfg["dest"] or "/media")
+        d = QFileDialog.getExistingDirectory(self, "Onde guardar os backups", self.win.cfg["dest"] or (str(core.HOME) if core.WIN else "/media"))
         if d:
             self.win.cfg["dest"] = d
             self.refresh()
@@ -357,7 +357,10 @@ class MainWindow(QMainWindow):
             sl.addWidget(b)
             self.stack.addWidget(self.pages[key])
         sl.addStretch()
-        rs = label("■  RSYNC" + (" · ONLINE" if core.rsync_ok() else " AUSENTE"), "muted" if core.rsync_ok() else "red", 1.5, 11, True)
+        if core.WIN and not core.rsync_ok():   # Windows: copia em Python com hardlinks (nao precisa do rsync)
+            rs = label("■  COPIA NATIVA · HARDLINKS", "muted", 1.5, 11, True)
+        else:
+            rs = label("■  RSYNC" + (" · ONLINE" if core.rsync_ok() else " AUSENTE"), "muted" if core.rsync_ok() else "red", 1.5, 11, True)
         rs.setContentsMargins(20, 0, 0, 0)
         sl.addWidget(rs)
         ver = label(f"RELIC v{VERSION}", "dim", 2, 11)
