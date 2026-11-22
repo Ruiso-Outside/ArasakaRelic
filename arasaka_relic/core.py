@@ -21,7 +21,7 @@ from pathlib import Path
 
 APP_ID = "arasaka-relic"
 APP_NAME = "ARASAKA RELIC"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 HOME = Path(os.environ.get("ARASAKA_RELIC_HOME") or Path.home())
 
@@ -199,8 +199,9 @@ def list_snapshots(dest: str | Path) -> list[Snapshot]:
 def rel_in_snapshot(src: Path) -> str:
     """Caminho dentro da foto: relativo a pasta pessoal (ou 'raiz/...' para fora dela)."""
     src = src.resolve() if src.exists() else src
+    home = HOME.resolve() if HOME.exists() else HOME   # Windows: nome curto (RUNNER~1) e longo sao a mesma pasta
     try:
-        return str(src.relative_to(HOME))
+        return str(src.relative_to(home))
     except ValueError:
         if WIN:   # C:\Dados\x -> raiz/C/Dados/x
             return str(Path("raiz", src.drive.rstrip(":\\/") or "unc", *src.parts[1:]))
